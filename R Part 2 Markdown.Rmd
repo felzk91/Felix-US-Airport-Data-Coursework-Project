@@ -1,0 +1,2466 @@
+---
+title: "R Part 2 Markdown"
+author: "Felix,Zhikai"
+date: "2024-04-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Importing necessary libraries
+```{r}
+library(tidyverse)
+library(RColorBrewer)
+library(hms)
+library(ggcorrplot)
+library(car)
+library(pROC)
+library(purrr)
+library(ROCR)
+library(caTools)
+library(caret)
+library(boot)
+library(glmnet)
+library(vcd)
+library(mlr3)
+library(mlr3pipelines)
+library(mlr3learners)
+library(mlr3tuning)
+library(mlr3misc)
+library(paradox)
+library(mlr)
+```
+
+# Part 2
+##(a) What are the beast times and days of the week to minimise delays each year?
+
+# 2.1 Data Cleaning
+
+Creating a list of CSV datas from 1998 till 2007
+```{r}
+data_list <- list()
+#Iterating and storing the data in a list
+for (year in 1998:2007) {
+  file_path <- paste0(year, ".csv")
+  data_list[[paste0(year, "_data")]] <- read.csv(file_path)
+}
+```
+
+Creating reusable functions for repetitive tasks.
+```{r}
+#Day of week Factor
+day_factor <- function(df, day_var){
+  day_order <- c("Mon", "Tue", "Wed", "Thur", "Fri", "Sat", "Sun")
+  df |> 
+    mutate({{day_var}} := factor({{day_var}}, levels = 1:7, labels = day_order))
+}
+
+#Month Factor
+month_factor <- function(df, month_var){
+  month_order <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+  df |> 
+    mutate({{month_var}} := factor({{month_var}}, levels = 1:12, labels = month_order))
+}
+
+#Covert column to Date and Time format
+convert_to_time_format <- function(df, columns_to_convert) {
+  df <- df  |> 
+    mutate(across(all_of(columns_to_convert), ~ {
+      hour <- . %/% 100  
+      minute <- . %% 100  
+      as.POSIXct(paste(hour, minute, sep = ":"), format = "%H:%M")  
+    }, .names = "{col}_time"))
+  
+  return(df)
+}
+
+#Creating a function that allow us to generate multiple histograms for a quick analysis of the varaibles in our dataframes.
+explore_distribution <- function(data, columns) {
+  for (col in columns) {
+    frequency_table <- table(data[[col]])
+    
+    frequency_df <- as.data.frame(frequency_table)
+    names(frequency_df) <- c("Value", "Frequency")
+    
+    print(ggplot(frequency_df, aes(x = Value, y = Frequency)) +
+            geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+            labs(title = paste("Frequency of", col),
+                 x = col,
+                 y = "Frequency"))
+    print(frequency_df)
+  }
+}
+
+#Creating a function that create time intervals
+
+create_time_intervals <- function(data, time_col) {
+  # Define break points for intervals
+  time_intervals <- seq(0, 2400, by = 400)
+  
+  # Define names for intervals
+  interval_names <- c("12am - 4am", "4am - 8am", "8am - 12pm", "12pm - 4pm", "4pm - 8pm", "8pm - 12am")
+  
+  # Creating a new column with time intervals
+  data <- data |> 
+    mutate(
+      Bins = cut_interval(
+        !!rlang::ensym(time_col),
+        breaks = time_intervals,
+        labels = interval_names,
+        right = FALSE
+      )
+    )
+  
+  return(data)
+}
+```
+
+Bind CSV data(s) into a dataframe
+```{r}
+#Merging the data into a dataframe and storing it in an object "flights".
+flights <- do.call(rbind, data_list)
+glimpse(flights)
+rm(data_list)
+```
+
+Transforming month and day of week data into easily understandable categories.
+```{r}
+#Converting "Month" and "DayOfWeek" to factors and re-leveling them according to the calendar (Jan, Feb, Mar etc...). Both factor functions are created previously (line 39)
+flights <- flights |> 
+  month_factor(Month) |> 
+  day_factor(DayOfWeek)
+glimpse(flights)
+```
+
+We've identified 73 duplicated observations in our dataset. These duplicates have been removed from our analysis.
+```{r}
+
+#Identify and remove duplicates to enhance the accuracy of our analysis.
+nrow(flights)
+flights <- flights |> 
+  distinct()
+
+nrow(flights)
+```
+
+
+Selecting the variables we may need to address question 2a.
+```{r}
+
+#Select variables
+flights_subset_1 <- flights |> 
+  select(Year,
+         Month,
+         DayOfWeek,
+         DepTime,
+         CRSDepTime,
+         DepDelay,
+         ArrDelay,
+         Diverted,
+         Cancelled)
+glimpse(flights_subset_1)
+```
+
+Check number of missing values for each variable. Missing value for DepTime, DepDelay and ArrDelay may be due to diverted or cancelled flights.
+```{r}
+missing_summary <- flights_subset_1 |> 
+  summarise_all(~sum(is.na(.))) |>  #Computing the number of NAs across variables in our dataframe
+  gather(variable, missing_count) #reshaping into long format for improved visualisation
+
+print(missing_summary)
+```
+
+Check if missing data is associated with diverted or cancelled flights.
+```{r}
+#Creating a table that counts the number of diverted and non-diverted flights.
+diverted_counts <- table(flights_subset_1$Diverted)
+print(diverted_counts)
+
+#Assess if NAs are presented for diverted flights.
+flights_subset_1 |> 
+  filter(Diverted == 1) |> 
+  head()
+```
+
+```{r}
+#Creating a table that counts the number of cancelled and non-cancelled flights.
+cancelled_counts <- table(flights_subset_1$Cancelled)
+print(cancelled_counts)
+
+#Aessessing if NAs are presented for cancelled flights.
+flights_subset_1 |> 
+  filter(Cancelled == 1) |> 
+  head()
+```
+
+
+
+We will exclude missing values from our analysis, focusing solely on flights that are not canceled or diverted, as we aim to determine the optimal time to minimize delays. After removing diverted and cancelled flights we still have 1 observation with missing value.
+```{r}
+#Remove diverted and cancelled flights from our dataframe subset.
+flights_subset_1 <- flights_subset_1 |> 
+  filter(Cancelled == 0, Diverted == 0)
+
+#Remive missing summary.
+missing_summary <- flights_subset_1 |> 
+  summarise_all(~sum(is.na(.))) |> 
+  gather(variable, missing_count)
+
+print(missing_summary)
+```
+
+```{r}
+#Checking the observation with missing value
+rows_with_missing <- flights_subset_1[is.na(flights_subset_1$ArrDelay), ]
+
+print(rows_with_missing)
+```
+After examining the flights dataframe, we couldn't identify any reasons for the missing values, nor can we compute the actual values due to the absence of flight dates. Therefore, we'll proceed by excluding this data from our analysis.
+```{r}
+missing_row_indices <- rownames(rows_with_missing)
+rows_in_original_df <- flights[missing_row_indices, ]
+print(rows_in_original_df)
+```
+
+
+```{r}
+FlightNum_3993 <- flights |> 
+  filter(FlightNum == 3993)
+
+head(FlightNum_3993)
+```
+
+Check to ensure that there are no missing values.
+```{r}
+#removing the observation with missing value.
+flights_subset_1 <- flights_subset_1 |> 
+  filter(!is.na(ArrDelay))
+
+#Checking if there are still any other missing values.
+missing_summary <- flights_subset_1 |> 
+  summarise_all(~sum(is.na(.))) |> 
+  gather(variable, missing_count)
+
+print(missing_summary)
+```
+Removing variables to reduce memory usage and streamline data processing.
+```{r}
+flights_subset_1 <- flights_subset_1 |> 
+  select(-Diverted, -Cancelled)
+```
+
+
+We'll create a new variable called "Total Delay," which represents the average of departure and arrival delays. Considering our goal to minimize delays, it's crucial to take both departure and arrival delays into account.
+```{r}
+  flights_subset_1 <- flights_subset_1 |> 
+  mutate(Total_Delay = (ArrDelay + DepDelay)/2)
+```
+
+# 2.2 DATA EXPLORATION
+
+Observe the distribution of each variable using histogram. It appears that there might be outliers for the "Total_Delay" variable, indicating a need for further investigation.
+```{r}
+explore_distribution(flights_subset_1, c("Year",
+                                         "Month",
+                                         "DayOfWeek"))
+```
+We observe the distribution for Total Delay using Kernel Density Plot. It appears that there might be outliers for the "Total_Delay" variable, indicating a need for further investigation.
+```{r}
+#Generate kernel density plot of Total Delay
+delay_density <- density(flights_subset_1$Total_Delay)
+
+# Plot kernel density
+plot(delay_density, main = "Kernel Density Plot of Total Delay", xlab = "Total Delay", ylab = "Density")
+```
+
+To conduct further investigation into the outliers, we filter all flights with departure and arrival delays greater than 15 minutes, as these are considered delayed flights. Then, we plot a boxplot. The boxplot reveals several outliers with values exceeding 147.75 mins.
+```{r}
+#Filtering Delayed flights.
+flights_subset_1_filter_delayed_flights <- flights_subset_1 |> 
+  filter(DepDelay > 15 & ArrDelay > 15)
+
+#Calculating IQR to determine outliers threshold.
+Q3 <- quantile(flights_subset_1_filter_delayed_flights$Total_Delay, probs = 0.75)
+IQR <- IQR(flights_subset_1_filter_delayed_flights$Total_Delay)
+maximum <- Q3 + 1.5 * IQR
+
+#Plotting the Boxplot
+flights_subset_1_filter_delayed_flights |> 
+  ggplot(aes(x = "", y = Total_Delay)) +
+  geom_boxplot() +
+  scale_y_continuous(trans = 'log10') +
+  labs(
+    title = "Box Plot of Total Delay",
+    y = "Total Delay (Log Scale)",
+    subtitle = paste("Upper Quartile (Q3):", round(Q3, 2), " | Maximum:", round(maximum, 2))) +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  theme_minimal()
+
+  
+```
+
+Given that 7% of the flights are outliers, which is a significant proportion, we will incorporate data with a total delay of less than 1440 minutes (equivalent to one day) for our analysis instead. Flights with delays exceeding 1440 minutes will be excluded, as excessively large delays can disproportionately influence the mean and potentially skew our analysis.
+```{r}
+#Filter flights above 147mins Total Delay (Outlier Threshold)
+proportion_above_147 <- mean(flights_subset_1_filter_delayed_flights$Total_Delay > 147)
+
+#Plotting Kernel density plot and calculating the proportion of outlier flights.
+flights_subset_1_filter_delayed_flights  |> 
+  ggplot(aes(x = Total_Delay)) +
+  geom_density(color = "blue", fill = "lightblue", alpha = 0.5) +  
+  geom_vline(xintercept = 147, linetype = "dashed", color = "red") +
+  geom_text(aes(x = 1000, y = 0.01, label = paste("Proportion of flights with above 147 mins total delay:", scales::percent(proportion_above_147))),
+            color = "red", size = 3) +
+  labs(
+    title = "Kernel Density Plot of Total Delay",
+    x = "Total Delay",
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+
+62 observations with Total Delays more than 1440mins are identified, contributing to 0.000007% of the data.
+```{r}
+#Computing the proporiton of flights with more than 1 day delay.
+proportion_above_depdelay_1440 <- mean(flights_subset_1_filter_delayed_flights$DepDelay > 1440)
+
+#Filtering flights that are more than one day.
+flights_above_1440 <-  flights_subset_1_filter_delayed_flights |>
+  filter(DepDelay > 1440)
+#Counting the number of flights with more than one day delay.
+num_flights_above_depdelay_1440 <- nrow(flights_above_1440)
+
+print(proportion_above_depdelay_1440)
+print(num_flights_above_depdelay_1440)
+summary(flights_above_1440)
+```
+
+Omitting Total_Delay > 1440
+```{r}
+#Ommiting extreme values from our analysis
+flights_subset_1 <- flights_subset_1 |> 
+  filter(DepDelay < 1441)
+```
+
+We will convert the "CRSDepTime" variable into categorical time intervals of 4 hours each.
+```{r}
+flights_subset_1 <- create_time_intervals(flights_subset_1, CRSDepTime)
+
+flights_subset_1 <- flights_subset_1 |>
+  rename(DepartureBins = Bins)
+```
+
+We conduct ANOVA to compare the mean delay times across different time intervals, month and Day of week to compare the mean.
+```{r}
+anova_time_interval <- aov(Total_Delay ~ DepartureBins, data = flights_subset_1)
+
+summary(anova_time_interval)
+```
+
+```{r}
+lm_model <- lm(anova_time_interval)
+
+# Obtain confidence intervals for group means
+ci <- confint(lm_model, level = 0.95)
+
+print(ci)
+
+rm(anova_time_interval)
+rm(lm_model)
+rm(flights_subset_1_filter_delayed_flights)
+```
+
+```{r}
+anova_time_DayOfWeek <- aov(Total_Delay ~ DayOfWeek, data = flights_subset_1)
+
+summary(anova_time_DayOfWeek)
+```
+
+```{r}
+lm_model <- lm(anova_time_DayOfWeek)
+
+# Obtain confidence intervals for group means
+ci <- confint(lm_model, level = 0.95)
+
+print(ci)
+
+rm(anova_time_DayOfWeek)
+rm(lm_model)
+```
+
+```{r}
+anova_time_Month <- aov(Total_Delay ~ Month, data = flights_subset_1)
+
+summary(anova_time_Month)
+```
+
+```{r}
+lm_model <- lm(anova_time_Month)
+
+# Obtain confidence intervals for group means
+ci <- confint(lm_model, level = 0.95)
+
+print(ci)
+
+rm(anova_time_Month)
+rm(lm_model)
+```
+
+# 2.3 DATA VISUALIZATION
+
+### When is the best time to fly to minimize delay?
+
+To create a summary of the proportion of delayed flights by different time intervals and day of the week, we'll calculate the percentage of delayed flights within each time interval and day of the week category. Based on the analysis, it appears that the time interval from 4 am to 8 am has the lowest proportion of delayed flights, suggesting it might be the best time to travel.
+```{r}
+#Aggregating data to compute delay proportion.
+delayed_proportion_summary_by_interval <- flights_subset_1 |> 
+  group_by(DayOfWeek, DepartureBins) |> 
+  summarise(
+    DelayProp = mean(DepDelay > 15 & ArrDelay > 15)
+  )
+
+print(delayed_proportion_summary_by_interval)
+```
+
+We'll visualize the delay proportion across different days of the week to observe if the time interval with the lowest delay proportion remains consistent across different days of the week.
+
+The plot confirms that the time interval from 4 am to 8 am is indeed the best time to travel, and this trend remains consistent across different days of the week.
+```{r}
+delayed_proportion_summary_by_interval |> 
+  ggplot(aes(DepartureBins, DelayProp, fill = DepartureBins)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~DayOfWeek) +
+  scale_fill_brewer(palette = "Set3") +
+  labs(
+    title = "Delayed Flight Proportion for Different Time Interval by Day of Week",
+    x = "Departure Time Interval",
+    y = "Delayed Flight Proportion by Month",
+    fill = "Departure Time Interval Legend"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),  #Aligning Title to middle
+    axis.text.x = element_text(angle = 45, hjust = 1),  #Slanting the X axis label so they won't overlap. This is to improve visualization.
+    panel.grid.major = element_blank(),  #Removing Grid lines to enhance visualization
+    panel.grid.minor = element_blank()
+  )
+```
+
+We will also create a summary for the mean total delay by different time intervals and day of the week to evaluate which time interval has the lowest average total delay.
+```{r}
+mean_delay_summary_by_interval <- flights_subset_1 |> 
+  group_by(DayOfWeek, DepartureBins) |> 
+  summarise(
+    MeanTotalDelay = mean(Total_Delay)
+  )
+
+print(mean_delay_summary_by_interval)
+```
+
+Similar to the delay proportion analysis, the assessment of mean total delay also indicates that the time interval from 4 am to 8 am remains the optimal time to travel, displaying both the lowest delay proportion and total delay consistently across different days of the week.
+```{r}
+mean_delay_summary_by_interval |> 
+  ggplot(aes(DepartureBins, MeanTotalDelay, fill = DepartureBins)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~DayOfWeek) +
+  scale_fill_brewer(palette = "Set3") +
+  labs(
+    title = "Mean Total Delay for Different Time Interval by Day of Week",
+    x = "Departure Time Interval",
+    y = "Mean Total Delay (min)",
+    fill = "Departure Time Interval Legend"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+We'll create a summary to observe if the time interval from 4 am to 8 am consistently exhibits the lowest delay proportion across different years.
+```{r}
+delayed_proportion_summary_by_interval_and_year <- flights_subset_1 |> 
+  group_by(Year, DepartureBins) |> 
+  summarise(DelayProp = mean(DepDelay > 15 & ArrDelay > 15))
+
+print(delayed_proportion_summary_by_interval_and_year)
+```
+
+The visualization indicates that 4am - 8am has the lowest delay proportion throughout the years.
+```{r}
+delayed_proportion_summary_by_interval_and_year |> 
+  ggplot(aes(x = Year, y = DelayProp, color = DepartureBins)) +
+  geom_line() +
+  xlab("Year") +
+  ylab("Delayed Flight Proportion by Month") +
+  labs(
+    title = "Delay Proportion by Time Interval for 1998 till 2007",
+    color = "Departure Time Interval Legend"
+  ) +
+  scale_color_brewer(palette = "Set3") +
+  scale_x_continuous(breaks = seq(1998, 2007, by = 2)) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+We'll create a summary to observe if the time interval from 4 am to 8 am consistently exhibits the lowest mean delay across different years.
+```{r}
+mean_total_delay_summary_by_interval_and_year <- flights_subset_1 |> 
+  group_by(Year, DepartureBins) |> 
+  summarise(MeanTotalDelay = mean(Total_Delay))
+
+print(mean_total_delay_summary_by_interval_and_year)
+```
+The visualization suggests that the time interval from 4 am to 8 am generally has the lowest mean delay throughout the years, except for 2002 and 2003, where there is a crossover, and the time interval from 12 am to 4 am exhibits the lowest mean delay.
+```{r}
+mean_total_delay_summary_by_interval_and_year |> 
+  ggplot(aes(x = Year, y = MeanTotalDelay, color = DepartureBins)) +
+  geom_line() +
+  xlab("Year") +
+  ylab("Mean Total Delay(min)") +
+  labs(
+    title = "Mean Total Delay by Time Interval for 1998 till 2007",
+    color = "Departure Time Interval Legend"
+  ) +
+  scale_color_brewer(palette = "Set3") +
+  scale_x_continuous(breaks = seq(1998, 2007, by = 2)) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+We'll group the data by scheduled departure hour and summarize the mean delay across different scheduled departure hours.
+```{r}
+flights_subset_1_mean_delay <- flights_subset_1 |> 
+  mutate(hour = if_else(CRSDepTime %/% 100 == 24, 0, CRSDepTime %/% 100)) |> 
+  group_by(hour) |> 
+  summarise(MeanTotalDelay = mean(Total_Delay)) |> 
+  arrange(MeanTotalDelay)
+
+print(flights_subset_1_mean_delay)
+```
+
+The visualization suggests that the optimal time to fly to minimize delay is around 5 am. Additionally, we observe that delays gradually increase and peak around 6 pm. This pattern aligns with the phenomenon where delays from earlier flights can cascade and affect subsequent flights, leading to increased delays as the day progresses.
+```{r}
+flights_subset_1_mean_delay |> 
+  ggplot(aes(x = hour, y = MeanTotalDelay)) +
+  geom_line() +
+  xlab("Scheduled Departure Hour") +
+  ylab("Mean Total Delay(min)") +
+  labs(
+    title = "Mean Total Delay by Departure Hour for 1998 till 2007"
+  ) +
+  scale_x_continuous(breaks = seq(0, 23, by = 2)) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+We'll group the data by scheduled departure hour and summarize the delay proportion across different scheduled departure hours.
+```{r}
+flights_subset_1_delay_proportion <- flights_subset_1 |> 
+  mutate(hour = if_else(CRSDepTime %/% 100 == 24, 0, CRSDepTime %/% 100)) |> 
+  group_by(hour) |> 
+  summarise(DelayProp = mean(DepDelay > 15 & ArrDelay > 15)) |> 
+  arrange(DelayProp)
+
+print(flights_subset_1_delay_proportion)
+```
+
+Similar observations are observed for delay proportions.
+```{r}
+flights_subset_1_delay_proportion |> 
+  ggplot(aes(x = hour, y = DelayProp)) +
+  geom_line() +
+  xlab("Scheduled Departure Hour") +
+  ylab("Delayed Flights Proportion by hour") +
+  labs(
+    title = "Delayed Flights Proportion by Departure Hour for 1998 till 2007"
+  ) +
+  scale_x_continuous(breaks = seq(0, 24, by = 2)) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### When is the best day of week to fly to minimize delay?
+
+We'll create a summary of delay proportion grouped by day of the week and month to visualize the day of the week with the lowest delay proportion.
+```{r}
+delayed_proportion_by_dayofweek <- flights_subset_1 |> 
+  group_by(DayOfWeek, Month) |> 
+  summarise(DelayProp = mean(DepDelay > 15 & ArrDelay >15))
+
+print(delayed_proportion_by_dayofweek)
+```
+
+Through the heatmap, we observe that Saturday is the best day to fly for minimal delay proportion. The results are also fairly consistent across different months.
+```{r}
+delayed_proportion_by_dayofweek |> 
+  ggplot(aes(DayOfWeek, Month, fill = DelayProp)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "orange") +
+  geom_text(aes(label = round(DelayProp, 2)), color = "black") +
+  labs(
+    title = "Delay Proportion by Day Of Week and Months",
+    x = "Day Of Week",
+    y = "Month",
+    fill = "Delay Proportion"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+A summary of delay proportion by day of week is created to evaluate the best day to fly for minimal delay.
+```{r}
+delayed_proportion_by_dayofweek <- flights_subset_1 |> 
+  group_by(DayOfWeek) |> 
+  summarise(DelayProp = mean(DepDelay > 15 & ArrDelay >15))
+
+print(delayed_proportion_by_dayofweek)
+```
+
+The bar plot shows that Saturday indeed is the best day of the week to fly with the lowest delay proportion.
+```{r}
+delayed_proportion_by_dayofweek |> 
+  ggplot(aes(DayOfWeek, DelayProp, fill = DayOfWeek)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Delayed flights proportion by Day of Week for 1998 till 2007",
+    x = "Day of Week",
+    y = "Delayed flights proportion",
+    fill = "Day of Week Legend"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+A summary of delay proportion by day of week and year is created to evaluate the best day to fly across different years to minimize delay.
+```{r}
+delayed_proportion_by_dayofweek_and_year <- flights_subset_1 |> 
+  group_by(DayOfWeek, Year) |> 
+  summarise(DelayProp = mean(DepDelay > 15 & ArrDelay >15))
+
+print(delayed_proportion_by_dayofweek_and_year)
+```
+Saturday remains as the best day of week to fly for minimal delay since 2002.
+```{r}
+delayed_proportion_by_dayofweek_and_year |> 
+  ggplot(aes(x = Year, y = DelayProp, color = DayOfWeek)) +
+  geom_line() +
+  xlab("Year") +
+  ylab("Delayed flights proportion by day of week") +
+  labs(
+    title = "Delayed flights proportion by day of week for 1998 till 2007",
+    color = "Day of Week Legend"
+  ) +
+  scale_color_brewer(palette = "Set2") +
+  scale_x_continuous(breaks = seq(1998, 2007, by = 2)) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+A summary of mean delay by day of week and month is created to evaluate the best day to fly across different month to minimize delay.
+```{r}
+mean_delay_by_dayofweek <- flights_subset_1 |> 
+  group_by(DayOfWeek, Month) |> 
+  summarise(MeanDelay = mean(Total_Delay))
+
+print(delayed_proportion_by_dayofweek)
+```
+
+Through the heatmap, we observe that saturday is the best day to fly for minimal mean delay. The results are also fairly consistent across different months.
+```{r}
+mean_delay_by_dayofweek |> 
+  ggplot(aes(DayOfWeek, Month, fill = MeanDelay)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "orange") +
+  geom_text(aes(label = round(MeanDelay, 2)), color = "darkblue") +
+  labs(
+    title = "Heatmap of Mean Delay by DayOfWeek and Months",
+    x = "DayOfWeek",
+    y = "Month",
+    fill = "Mean Delay(min)"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+A summary of mean delay by day of week is created to evaluate the best day to fly for minimal delay.
+
+```{r}
+mean_delay_by_dayofweek <- flights_subset_1 |> 
+  group_by(DayOfWeek) |> 
+  summarise(MeanDelay = mean(Total_Delay)) 
+
+print(mean_delay_by_dayofweek)
+```
+
+The bar plot shows that Saturday indeed is the best day of the week to fly with the lowest mean delay.
+
+```{r}
+mean_delay_by_dayofweek |> 
+  ggplot(aes(DayOfWeek, MeanDelay, fill = DayOfWeek)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Mean Delay by Day of Week for 1998 till 2007",
+    x = "Day of Week",
+    y = "Mean Total Delay",
+    fill = "Day of Week Legend"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+A summary of mean delay by day of week and year is created to evaluate the best day to fly across different years to minimize delay.
+```{r}
+mean_delay_by_dayofweek_and_year <- flights_subset_1 |> 
+  group_by(DayOfWeek, Year) |> 
+  summarise(MeanDelay = mean(Total_Delay))
+
+print(mean_delay_by_dayofweek_and_year)
+```
+
+Saturday remains as the best day of week to fly for minimal mean delay since 2002.
+
+```{r}
+mean_delay_by_dayofweek_and_year |> 
+  ggplot(aes(x = Year, y = MeanDelay, color = DayOfWeek)) +
+  geom_line() +
+  xlab("Year") +
+  ylab("Mean delay by day of week") +
+  labs(
+    title = "Mean delay by day of week for 1998 till 2007",
+    color = "Day of Week Legend"
+  ) +
+  scale_color_brewer(palette = "Set2") +
+  scale_x_continuous(breaks = seq(1998, 2007, by = 2)) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+### When is the best month to fly to minimize delay?
+
+To evaluate which is the best month to fly to minimize delay, we will create a summary of delay proportion by month.
+```{r}
+delayed_proportion_by_month <- flights_subset_1 |> 
+  group_by(Month) |> 
+  summarise(DelayProp = mean(DepDelay > 15 & ArrDelay > 15)) |> 
+  mutate(Month = reorder(Month, DelayProp))
+
+print(delayed_proportion_by_month)
+```
+
+
+We observe that September has the lowest delay proportion.
+```{r}
+delayed_proportion_by_month |> 
+  ggplot(aes(Month, DelayProp, fill = Month)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Flights Delayed Proportion for Different Month",
+    x = "Month",
+    y = "Flights Delayed Proportion by Month",
+    fill = "Month Legend"
+  ) +
+  scale_fill_viridis_d() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+A summary of mean delay by month is also created to evaluate the best month to fly for minimal delay.
+```{r}
+mean_total_delay_by_month <- flights_subset_1 |> 
+  group_by(Month) |> 
+  summarise(MeanTotalDelay = mean(Total_Delay),
+            DelayProp = mean(DepDelay > 15 & ArrDelay > 15)) |> 
+  mutate(Month = reorder(Month, DelayProp))
+
+print(mean_total_delay_by_month)
+```
+
+We observe that September has the lowest mean delay.
+```{r}
+mean_total_delay_by_month |> 
+  ggplot(aes(Month, MeanTotalDelay, fill = Month)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Mean Total Delay for Different Month",
+    x = "Month",
+    y = "Mean Total Delay(min)",
+    fill = "Month Legend"
+  ) +
+  scale_fill_viridis_d() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+We aim to assess whether the trend of September being the month with minimal delay is consistent across different years. A summary of delay proportion by month and year is created for our analysis.
+```{r}
+delayed_proportion_by_month_and_year <- flights_subset_1 |> 
+  group_by(Year, Month) |> 
+  summarise(DelayProp = mean(DepDelay > 15 & ArrDelay > 15))
+
+print(delayed_proportion_by_month_and_year)
+```
+The line chart displays several crossovers between different months; however, September and October consistently maintain one of the lowest proportions across different years.
+```{r}
+custom_palette <- c("Sep" = "blue", "Oct" = "red") #Setting the colour for September and October and saving it into an object
+
+delayed_proportion_by_month_and_year |> 
+  ggplot(aes(x = Year, y = DelayProp, color = Month)) +
+  geom_line() +
+  xlab("Year") +
+  ylab("Delayed Flights Proportion by Month") +
+  labs(
+    title = "Delay Proportion by Month for 1998 till 2007",
+    color = "Month Legend"
+  ) +
+  scale_color_manual(values = custom_palette) +     #Setting the color according to the custom palette
+  scale_x_continuous(breaks = seq(1998, 2007, by = 2)) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+mean_total_delay_by_month_and_year <- flights_subset_1 |> 
+  group_by(Year, Month) |> 
+  summarise(MeanTotalDelay = mean(Total_Delay))
+
+print(mean_total_delay_by_month_and_year)
+```
+
+Similar observations for mean delay where September and October consistently maintain one of the lowest proportions across different years.
+```{r}
+custom_palette <- c("Sep" = "blue", "Oct" = "red")
+
+mean_total_delay_by_month_and_year |> 
+  ggplot(aes(x = Year, y = MeanTotalDelay, color = Month)) +
+  geom_line() +
+  xlab("Year") +
+  ylab("Mean Total Delay") +
+  labs(
+    title = "Mean Total Delay by Month for 1998 till 2007",
+    color = "Month Legend"
+  ) +
+  scale_color_manual(values = custom_palette) +
+  scale_x_continuous(breaks = seq(1998, 2007, by = 2)) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+We generate a heatmap to evaluate if the best month to fly is consistent across the year.
+```{r}
+custom_palette <- twilight_palette <- custom_palette <- c("#000000", "#4B0082", "#800080", "#FFA500", "#FFE4C4")
+
+delayed_proportion_by_month_and_year <- delayed_proportion_by_month_and_year %>%
+  arrange(desc(DelayProp)) %>%
+  mutate(Month = factor(Month, levels = rev(unique(Month))))
+
+delayed_proportion_by_month_and_year |> 
+  ggplot(aes(Year, Month, fill = DelayProp)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = custom_palette, limits = c(min(delayed_proportion_by_month_and_year$DelayProp), max(delayed_proportion_by_month_and_year$DelayProp)), oob = scales::rescale_none) +
+  labs(
+    title = "Heatmap of Delay Proportion by month and year",
+    x = "Year",
+    y = "Month",
+    fill = "Delay Proportion"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  scale_x_continuous(breaks = seq(1998, 2007))
+```
+
+Part 2
+##(b) Evaluate whether older planes suffer more delays on a year-to-year basis.
+
+# 3.1 Data Cleaning
+
+```{r}
+objects_to_keep <- c("flights", "explore_distribution")
+
+#Retrive the names of all objects in our global environment.
+all_objects <- ls()
+
+#Identify objects to remove (those not in the objects_to_keep list).
+objects_to_remove <- setdiff(all_objects, objects_to_keep)
+
+#Remove objects
+rm(list = objects_to_remove)
+```
+
+
+Selecting the variables we may need to address question 2b.
+```{r}
+flights_subset_2 <- flights |> 
+  filter(Cancelled == 0, Diverted == 0) |> 
+  select(Year,
+         UniqueCarrier,
+         DepDelay,
+         ArrDelay,
+         CarrierDelay,
+         WeatherDelay,
+         NASDelay,
+         SecurityDelay,
+         LateAircraftDelay,
+         TailNum)
+
+#Remove dataframes from our Global Environment to free up memory.
+rm(flights)
+```
+
+Read plane-data.csv stored as object "planes".
+```{r}
+planes <- read.csv("plane-data.csv")
+```
+
+Combine flights and planes data frames containing all the rows of flights data. This will result in a data frame that contains planes information including the year it is issued, and it's manufacturer. We will need these information to address question 2b.
+```{r}
+flights_subset_2 <- flights_subset_2 |> 
+  left_join(planes, join_by(TailNum == tailnum))
+
+glimpse(flights_subset_2)
+```
+NAs are identified for multiple variables. We will replace NAs with 0 for "CarrierDelay", "LateAircraftDelay", "NASDelay", "WeatherDelay", "SecurityDelay".
+```{r}
+flights_subset_2$CarrierDelay[is.na(flights_subset_2$CarrierDelay)] <- 0
+flights_subset_2$NASDelay[is.na(flights_subset_2$NASDelay)] <- 0
+flights_subset_2$SecurityDelay[is.na(flights_subset_2$SecurityDelay)] <- 0
+flights_subset_2$WeatherDelay[is.na(flights_subset_2$WeatherDelay)] <- 0
+flights_subset_2$LateAircraftDelay[is.na(flights_subset_2$LateAircraftDelay)] <- 0
+```
+
+We generate a pivot table summarizing the mean delay for each reason by year to investigate the presence of NAs. The table reveals that the mean delay is consistently 0 from 1998 to 2002, and the value for 2003 is not consistent with those from 2004 to 2007. This discrepancy suggests a possible reason: delays for each reason were not recorded before 2003.
+```{r}
+flights_delay_summary_by_year <- flights_subset_2 |> 
+  group_by(Year) |> 
+  summarise(CarrierDelay_Mean = mean(CarrierDelay),
+            NASDelay_Mean = mean(NASDelay),
+            SecurityDelay_Mean = mean(SecurityDelay),
+            WeatherDelay_Mean = mean(WeatherDelay),
+            LateAircraftDelay_Mean = mean(LateAircraftDelay))
+
+print(flights_delay_summary_by_year)
+```
+
+Check for missing values.
+```{r}
+missing_summary <- flights_subset_2 |> 
+  summarise_all(~sum(is.na(.))) |> 
+  gather(variable, missing_count)
+
+print(missing_summary)
+```
+
+Since the year of manufacture of the aircraft is necessary for our analysis, We will exclude observations with missing values from our analysis. These missing values are likely due to the lack of information about the aircraft operating those flights. 
+```{r}
+flights_subset_2_NA_omit <- na.omit(flights_subset_2)
+```
+
+Check for missing values.
+```{r}
+missing_summary <- flights_subset_2_NA_omit |> 
+  summarise_all(~sum(is.na(.))) |> 
+  gather(variable, missing_count)
+
+print(missing_summary)
+```
+
+Check data type. 
+```{r}
+str(flights_subset_2_NA_omit)
+```
+Converting Issue_Date to date type.
+```{r}
+flights_subset_2_NA_omit <- flights_subset_2_NA_omit |> 
+  mutate(issue_date = as.Date(issue_date, format = "%m/%d/%Y"))
+
+glimpse(flights_subset_2_NA_omit)
+```
+Converting "year" to integer. NAs introduced by coercion will most probably due to values that are not stored in numeric format. For these data we will use the year of issue date as our "year". 
+```{r}
+flights_subset_2_NA_omit$year <- as.integer(flights_subset_2_NA_omit$year) 
+
+flights_subset_2_NA_omit <- flights_subset_2_NA_omit |> 
+  mutate(year = if_else(is.na(year), year(issue_date), year))
+```
+
+Check if there are still any missing values. 2415015 NAs are still present. This is due to blank data stored in certain observations.
+```{r}
+flights_subset_2_NA_omit <- flights_subset_2_NA_omit |> 
+  mutate(PlaneAge = Year - year)
+
+summary(flights_subset_2_NA_omit$PlaneAge)
+```
+
+As suspected, issue_date(s) were previously blank and were converted to <NA> when we convert the column to date datatype.
+```{r}
+Plane_Age_NA <- flights_subset_2_NA_omit |> 
+  filter(is.na(PlaneAge))
+
+head(Plane_Age_NA)
+```
+Check number of missing values.
+```{r}
+missing_summary <- flights_subset_2_NA_omit |> 
+  summarise_all(~sum(is.na(.) | . == "")) |> 
+  gather(variable, missing_count)
+
+print(missing_summary)
+```
+
+We will have to omit these observations from our analysis as plane age is crutial for our analysis.
+```{r}
+flights_subset_2_NA_omit <- na.omit(flights_subset_2_NA_omit)
+```
+
+# 3.2 Data Exploration
+
+
+Histograms are plotted for the variables to observe their distributions. A discrepancy is noted in the distribution of plane age, as there are instances of negative ages, which is not feasible. Additionally, aircraft ages range from 2003 to 2007, indicating potential errors that require further investigation.
+```{r}
+explore_distribution(flights_subset_2_NA_omit, c("PlaneAge", "manufacturer", "type", "aircraft_type", "engine_type", "UniqueCarrier"))
+```
+
+
+The summary reveals that for the variable "year," there is a value of 0, which is likely the reason for the aircraft age exceeding 51 years.
+```{r}
+summary(flights_subset_2_NA_omit$year)
+```
+
+Once again we will extract the year of issue date for 'year' with 0. 
+```{r}
+flights_subset_2_NA_omit <- flights_subset_2_NA_omit |> 
+  mutate(year = if_else(year == 0, year(issue_date), year))
+```
+
+```{r}
+summary(flights_subset_2_NA_omit$year)
+```
+
+
+We will exclude observations with a plane age below 1, as it is not feasible for the age of an aircraft to be negative. This error may be due to discrepancies in data entry.
+```{r}
+flights_subset_2_clean <- flights_subset_2_NA_omit |> 
+  filter(PlaneAge > 0)
+
+hist(flights_subset_2_clean$PlaneAge, breaks = 50)
+
+rm(flights_subset_2)
+rm(flights_subset_2_NA_omit)
+```
+We aim to assess whether older aircraft experience higher delay proportions. We'll generate a summary presenting delay proportions across different aircraft ages.
+```{r}
+delay_prop_planeage_summary <- flights_subset_2_clean |> 
+  group_by(PlaneAge) |> 
+  summarise(DelayProp = mean(ArrDelay > 15 & DepDelay > 15))
+
+print(delay_prop_planeage_summary)
+```
+
+The barplot does not shown an increasing trend where older aircrafts exhibit a higher delay proportion.
+```{r}
+delay_prop_planeage_summary |> 
+  ggplot(aes(PlaneAge, DelayProp)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Delayed Flights Proportion by Plane Age",
+    x = "Plane Age",
+    y = "Delayed Flights Proportion by Plane Age",
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+Creating a new column with Total_Delay column, which is the average of arrival and departure delay.
+```{r}
+flights_subset_2_clean <- flights_subset_2_clean |> 
+  mutate(Total_Delay = (ArrDelay + DepDelay)/2)
+```
+
+We fit a regression model to test the null hypothesis - There is no relationship between the age of aircraft and the total delay.
+```{r}
+#Fitting a regression model and saving it into an object 'model'.
+model <- lm(Total_Delay ~ PlaneAge, data = flights_subset_2_clean)
+
+#Generate model summary.
+summary(model)
+```
+
+We generate a residual plot the test the normality of errors assumption.
+```{r}
+residuals <- residuals(model)
+hist(residuals, breaks = 3500)
+```
+
+A correlation matrix was generated to examine the relationships between variables. We found moderate to strong correlations between Total Delay and both Carrier and Late Aircraft Delay. Interestingly, we also noted a very weak correlation of 0.01 between Total Delay and Plane Age.
+```{r}
+selected_column <- flights_subset_2_clean |> 
+  filter(Year > 2003) |> 
+  select(Total_Delay,
+         CarrierDelay,
+         NASDelay,
+         WeatherDelay,
+         SecurityDelay,
+         LateAircraftDelay,
+         PlaneAge,
+         Year)
+
+correlation_matrix <- cor(selected_column)
+
+ggcorrplot(correlation_matrix, type = "lower", outline.color = "white", lab = TRUE, title = "Correlation Matrix for Flights after 2003",
+           ggtheme = ggplot2::theme_minimal(), lab_col = "black")
+print(correlation_matrix)
+
+correlation_result <- cor.test(selected_column$PlaneAge, selected_column$Total_Delay)
+
+print(correlation_result)
+```
+
+
+
+To evaluate the coefficient of Plane age on a year to year basis, we will create a dataframe that will store relevant values that we can use for our analysis.
+```{r}
+#Initialize an empty data frame to store results.
+coefficients_df <- data.frame(year = integer(), term = character(), coefficient = numeric(), r_squared = numeric(), p_value = numeric(), stringsAsFactors = FALSE)
+
+#Iterating through each year from 1998 to 2007.
+for (n in 1998:2007) {
+  #Creating a subset for iterated year.
+  flights_subset_year <- flights_subset_2_clean  |> 
+    filter(Year == n)
+  
+  #Fit linear regression model.
+  model <- lm(Total_Delay ~ PlaneAge, data = flights_subset_year)
+  
+  #Extract coefficients, R-squared, and p-value and store it into a dataframe that we can use later to visualise the coefficients.
+  coef_vals <- coef(model)
+  r_squared <- summary(model)$r.squared
+  p_value <- summary(model)$coefficients[2, 4]
+  coefficients_temp <- data.frame(year = n, term = names(coef_vals), coefficient = coef_vals, r_squared = r_squared, p_value = p_value)
+  
+  #Append values to dataframe
+  coefficients_df <- rbind(coefficients_df, coefficients_temp)
+  #We remove the subset at the end of each iteration to ensure minimal memory usage when running the code.
+  rm(flights_subset_year)
+}
+
+print(coefficients_df)
+
+```
+
+We use pivot wider function to reshape our dataframe from long to wide format so we can use it for our visualisation.
+```{r}
+coefficients_df <- coefficients_df |> 
+  pivot_wider(names_from = term,
+              values_from = coefficient) |> 
+  rename(PlaneAgeCoef = PlaneAge,
+         InterceptCoef = `(Intercept)`)
+
+#Print to check the resulting dataframe.
+print(coefficients_df)
+```
+
+# 3.3 Data Visualisation
+
+We visualise the PlaneAge coefficients over the years with a line chart.
+```{r}
+ggplot(coefficients_df, aes(x = year, y = PlaneAgeCoef)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(x = "Year", y = "PlaneAge Coefficient", title = "PlaneAge Coefficient by Year") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(1998, 2007, by = 2))
+```
+
+We created a scatter plot to visualize the relationship between the age of the plane and the total delay. To prevent overlapping of points and provide better visibility of density, we applied jitter to each point. Additionally, we fitted a model to the data, and the blue line in the plot represents the regression line.
+```{r}
+flights_subset_2_clean |> 
+  ggplot(aes(PlaneAge, Total_Delay)) +
+  geom_jitter(width = 0.5, height = 0, alpha = 0.12) + 
+  geom_smooth(method = "lm", se = FALSE, color = "darkblue") +
+  labs(
+    title = "Scatter Plot with Regression Line for Aircraft Age versus Total Delay",
+    x = "Aircraft Age",
+    y = "Total Delay"
+  ) +
+  theme_minimal()
+```
+We read carriers.csv and store it as an object "carriers". When then combine it with "flights_subset_2_clen" dataframe using leftjoin function.
+```{r}
+carriers <- read.csv("carriers.csv")
+
+flights_subset_2_clean <- flights_subset_2_clean |> 
+  left_join(carriers, join_by(UniqueCarrier == Code))
+```
+
+Renaming the column for clarity purposes.
+```{r}
+flights_subset_2_clean <- flights_subset_2_clean |> 
+  rename(Carrier = Description)
+```
+
+We also merge and renamed the values for both US Airways and America West Airlines as both companies merged on 9/05.
+```{r}
+flights_subset_2_clean <- flights_subset_2_clean %>%
+  mutate(Carrier = case_when(
+    Carrier == "America West Airlines Inc. (Merged with US Airways 9/05. Stopped reporting 10/07.)" ~ "US Airways Inc.",
+    Carrier == "US Airways Inc. (Merged with America West 9/05. Reporting for both starting 10/07.)" ~ "US Airways Inc.",
+    TRUE ~ Carrier
+  ))
+```
+
+Given the strong correlation between Total Delay and carrier-specific delays, as indicated by the Pearson correlation coefficient, we aim to enhance the explanatory capability of our model by including carrier information as a predictor. We will fit the carrier variable into the regression model and evaluate its impact on model performance.
+```{r}
+#Convert UniqueCarrier to factor.
+flights_subset_2_clean$Carrier <- as.factor(flights_subset_2_clean$Carrier)
+
+#Relevel UniqueCarrier with "DL" as the reference level.
+flights_subset_2_clean$Carrier <- relevel(flights_subset_2_clean$Carrier, ref = "Delta Air Lines Inc.")
+
+#Fit regression model.
+model <- lm(Total_Delay ~ PlaneAge + Carrier, data = flights_subset_2_clean)
+
+summary(model)
+
+```
+
+Check for multicollinearity
+```{r}
+#Assess multicollinearity between Carrier and PlaneAge.
+vif(model)
+```
+
+## (c)For each year, fit a logistic regression model for the probability of diverted US flights using as many features as possible from attributes of the departure date, the scheduled departure and arrival times, the coordinates and distance between departure and planned arrival airports, and the carrier. Visualize the coefficients across years.
+
+# 4.1 Data Cleaning
+
+Removing all unwanted data in our environment to free up memory.
+```{r}
+
+all_objects <- ls()
+
+#Remove objects
+rm(list = all_objects)
+```
+
+Creating reusable functions for repetitive tasks.
+```{r}
+#Day of week Factor
+day_factor <- function(df, day_var){
+  day_order <- c("Mon", "Tue", "Wed", "Thur", "Fri", "Sat", "Sun")
+  df |> 
+    mutate({{day_var}} := factor({{day_var}}, levels = 1:7, labels = day_order))
+}
+
+#Month Factor
+month_factor <- function(df, month_var){
+  month_order <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+  df |> 
+    mutate({{month_var}} := factor({{month_var}}, levels = 1:12, labels = month_order))
+}
+
+#Covert column to Date and Time format
+convert_to_time_format <- function(df, columns_to_convert) {
+  df <- df  |> 
+    mutate(across(all_of(columns_to_convert), ~ {
+      hour <- . %/% 100  
+      minute <- . %% 100  
+      as.POSIXct(paste(hour, minute, sep = ":"), format = "%H:%M")  
+    }, .names = "{col}_time"))
+  
+  return(df)
+}
+
+#Creating a function that allow us to generate multiple histograms for a quick analysis of the varaibles in our dataframes.
+explore_distribution <- function(data, columns) {
+  for (col in columns) {
+    frequency_table <- table(data[[col]])
+    
+    frequency_df <- as.data.frame(frequency_table)
+    names(frequency_df) <- c("Value", "Frequency")
+    
+    print(ggplot(frequency_df, aes(x = Value, y = Frequency)) +
+            geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+            labs(title = paste("Frequency of", col),
+                 x = col,
+                 y = "Frequency"))
+    print(frequency_df)
+  }
+}
+
+#Creating a function that create time intervals
+
+create_time_intervals <- function(data, time_col) {
+  # Define break points for intervals
+  time_intervals <- seq(0, 2400, by = 400)
+  
+  # Define names for intervals
+  interval_names <- c("12am - 4am", "4am - 8am", "8am - 12pm", "12pm - 4pm", "4pm - 8pm", "8pm - 12am")
+  
+  # Creating a new column with time intervals
+  data <- data |> 
+    mutate(
+      Bins = cut_interval(
+        !!rlang::ensym(time_col),
+        breaks = time_intervals,
+        labels = interval_names,
+        right = FALSE
+      )
+    )
+  
+  return(data)
+}
+```
+
+```{r}
+data_list <- list()
+#Iterating and storing the data in a list
+for (year in 1998:2007) {
+  file_path <- paste0(year, ".csv")
+  data_list[[paste0(year, "_data")]] <- read.csv(file_path)
+}
+```
+
+Bind CSV data(s) into a dataframe
+```{r}
+flights <- do.call(rbind, data_list)
+glimpse(flights)
+```
+
+We've identified 73 duplicated observations in our dataset. These duplicates have been removed from our analysis.
+```{r}
+rm(data_list)
+
+nrow(flights)
+flights <- flights |> 
+  distinct()
+
+nrow(flights)
+```
+
+Select the variables required to address question 2(c). We also remove flights from the environment to free up memory.
+```{r}
+flights_subset_3 <- flights |> 
+  select(Year,
+         Month,
+         DayOfWeek,
+         CRSDepTime,
+         CRSArrTime,
+         TailNum,
+         CRSElapsedTime,
+         Origin,
+         Dest,
+         Distance,
+         Cancelled,
+         Diverted,
+         UniqueCarrier)
+
+glimpse(flights_subset_3)
+rm(flights)
+```
+
+Transforming month and day of week data into easily understandable categories.
+```{r}
+flights_subset_3 <- flights_subset_3 |> 
+  month_factor(Month) |> 
+  day_factor(DayOfWeek)
+glimpse(flights_subset_3)
+```
+Creating Time Intervals categories for both scheduled departure and arrival time.
+```{r}
+flights_subset_3 <- create_time_intervals(flights_subset_3, CRSDepTime)
+
+flights_subset_3 <- flights_subset_3 |> 
+  rename(DepartureInterval = Bins)
+
+flights_subset_3 <- create_time_intervals(flights_subset_3, CRSArrTime)
+
+flights_subset_3 <- flights_subset_3 |> 
+  rename(ArrivalInterval = Bins)
+```
+
+
+```{r}
+str(flights_subset_3)
+```
+
+Read airports.csv
+```{r}
+airports <- read_csv("airports.csv")
+```
+Merging airports with subset 3 using left join with "Origin" and "iata" as key. 
+```{r}
+flights_subset_3<- flights_subset_3 |> 
+  left_join(airports, join_by(Origin == iata)) |> 
+  rename(
+    airport_Origin = airport,
+    city_Origin = city,
+    state_Origin = state,
+    country_Origin = country,
+    lat_Origin = lat,
+    long_Origin = long
+  )
+```
+
+```{r}
+glimpse(flights_subset_3)
+```
+
+```{r}
+flights_subset_3<- flights_subset_3 |> 
+  left_join(airports, join_by(Dest == iata)) |> 
+  rename(
+    airport_Dest = airport,
+    city_Dest = city,
+    state_Dest = state,
+    country_Dest = country,
+    lat_Dest = lat,
+    long_Dest = long
+  )
+
+glimpse(flights_subset_3)
+```
+
+
+We read carriers.csv and store it as an object "carriers". When then combine it with "flights_subset_3" dataframe using leftjoin function.
+```{r}
+carriers <- read.csv("carriers.csv")
+planes <- read.csv("plane-data.csv")
+```
+
+
+```{r}
+flights_subset_3 <- flights_subset_3 |> 
+  left_join(carriers, join_by(UniqueCarrier == Code))
+```
+
+
+Renaming the column for clarity purposes.
+```{r}
+flights_subset_3 <- flights_subset_3 |> 
+  rename(Carrier = Description)
+```
+
+We also merge and renamed the values for both US Airways and America West Airlines as both companies merged on 9/05.
+```{r}
+flights_subset_3 <- flights_subset_3 |> 
+  mutate(Carrier = case_when(
+    Carrier == "America West Airlines Inc. (Merged with US Airways 9/05. Stopped reporting 10/07.)" ~ "US Airways Inc.",
+    Carrier == "US Airways Inc. (Merged with America West 9/05. Reporting for both starting 10/07.)" ~ "US Airways Inc.",
+    TRUE ~ Carrier
+  ))
+```
+
+Check for missing values. There are missing values in various variables, however these variables are not required for our analysis, hence we remove them from the dataframe.
+```{r}
+missing_summary <- flights_subset_3 |> 
+  summarise_all(~sum(is.na(.))) |> 
+  gather(variable, missing_count)
+
+print(missing_summary)
+```
+
+One observation in our dataset is missing the destination airport information. Since we couldn't locate this data in our airport database, we will exclude this particular observation from our dataset.
+```{r}
+flights_subset_3 |> 
+  filter(is.na(airport_Dest)) |> 
+  head()
+```
+Variables that are not required for this analysis will be removed. 
+```{r}
+flights_subset_3 <- flights_subset_3 |> 
+  select(-CRSElapsedTime,
+         -city_Origin,
+         -state_Origin,
+         -city_Dest,
+         -state_Dest) |> 
+  filter(!is.na(airport_Dest)) #excluding the observation with missing value
+```
+
+Check if there are still other missing value.
+```{r}
+missing_summary <- flights_subset_3 |> 
+  summarise_all(~sum(is.na(.))) |> 
+  gather(variable, missing_count)
+
+print(missing_summary)
+```
+
+
+We aim to assess whether the likelihood of diverted flights is influenced by factors such as engine type, aircraft type, plane age, or manufacturer. To conduct this analysis, we intend to create a new subset, anticipating that this process may result in the removal of numerous observations, as observed in our previous analysis in part (b).
+```{r}
+flights_subset_4 <- flights_subset_3 |> 
+  left_join(planes, join_by(TailNum == tailnum))
+```
+
+```{r}
+flights_subset_4 <- flights_subset_4 |> 
+  mutate(issue_date = as.Date(issue_date, format = "%m/%d/%Y"))
+```
+
+```{r}
+flights_subset_4$year <- as.integer(flights_subset_4$year) 
+```
+
+```{r}
+flights_subset_4 <- flights_subset_4 |> 
+  mutate(year = if_else(is.na(year), year(issue_date), year))
+```
+
+```{r}
+flights_subset_4 <- flights_subset_4 |> 
+  mutate(year = if_else(year == 0, year(issue_date), year))
+```
+
+
+```{r}
+flights_subset_4 <- flights_subset_4 |> 
+  mutate(PlaneAge = Year - year)
+```
+
+```{r}
+flights_subset_4 <- na.omit(flights_subset_4)
+```
+
+
+```{r}
+flights_subset_4 <- flights_subset_4 |> 
+  filter(PlaneAge > 0, PlaneAge < 53)
+```
+
+# 4.2 Data Exploration
+
+Upon exploring the distribution of variables in our dataframe, we've observed that the frequency of diverted flights is relatively low. Additionally, variables such as engine type, aircraft type, and manufacturer exhibit a large number of groups. To manage this, we intend to aggregate these groups into smaller, more manageable categories.
+```{r}
+explore_distribution(flights_subset_4, c("Diverted",
+                                         "Month",
+                                         "DayOfWeek",
+                                         "DepartureInterval",
+                                         "ArrivalInterval",
+                                         "UniqueCarrier",
+                                         "Dest",
+                                         "Origin",
+                                         "manufacturer",
+                                         "engine_type",
+                                         "aircraft_type"))
+```
+
+```{r}
+unique_values <- unique(flights_subset_4$manufacturer)
+unique_values_list_manufacturer <- as.list(unique_values)
+print(unique_values_list_manufacturer)
+```
+
+```{r}
+flights_subset_4 <- flights_subset_4  |> 
+  mutate(manufacturer = case_when(
+    manufacturer == "BOEING" ~ "Boeing",
+    manufacturer %in% c("AIRBUS INDUSTRIE", "AIRBUS") ~ "Airbus",
+    manufacturer %in% c("MCDONNELL DOUGLAS AIRCRAFT CO", "MCDONNELL DOUGLAS CORPORATION", "MCDONNELL DOUGLAS") ~ "Mcdonnell",
+    manufacturer == "BOMBARDIER INC" ~ "Bombardier",
+    manufacturer == "EMBRAER" ~ "Embraer",
+    TRUE ~ "Others"
+  ))
+```
+
+```{r}
+explore_distribution(flights_subset_4, "manufacturer")
+```
+
+```{r}
+unique_values <- unique(flights_subset_4$engine_type)
+unique_values_list_engine <- as.list(unique_values)
+print(unique_values_list_engine)
+```
+
+```{r}
+flights_subset_4 <- flights_subset_4  |> 
+  mutate(engine_type = case_when(
+    engine_type %in% c("Turbo-Jet", "Turbo-Fan", "Turbo-Prop") ~ engine_type,
+    TRUE ~ "Others"
+  ))
+```
+
+```{r}
+explore_distribution(flights_subset_4, "engine_type")
+```
+```{r}
+flights_subset_4 <- flights_subset_4  |> 
+  mutate(aircraft_type = case_when(
+   aircraft_type %in% c("Fixed Wing Multi-Engine") ~ aircraft_type,
+    TRUE ~ "Others"
+  ))
+```
+
+```{r}
+explore_distribution(flights_subset_4, "aircraft_type")
+```
+
+```{r}
+ggplot(data = flights_subset_4, aes(x = Distance)) +
+  geom_density(fill = "skyblue", color = "blue") +
+  labs(title = "Kernel Density Plot of Flight Distances",
+       x = "Distance",
+       y = "Density")
+```
+
+
+Checking for outliers for "Distance" variable.
+```{r}
+ggplot(flights_subset_4, aes(x = factor(Diverted), y = Distance)) +
+  geom_boxplot()
+```
+
+We compute the maximum to detemine a cutoff point beyond which data points are considered outliers.
+```{r}
+Q3 <- quantile(flights_subset_4$Distance, probs = 0.75)
+IQR <- IQR(flights_subset_4$Distance)
+maximum <- Q3 + 1.5 * IQR
+
+print(maximum)
+```
+
+We have detected 3,289,407 outliers in our dataset. Considering that these outlier values are not excessively extreme and appear to be genuine data points rather than resulting from data entry errors, we have decided to retain these values. Additionally, since our sample size is large, these outliers are less likely to significantly influence our overall analysis.
+```{r}
+nrow(flights_subset_4 |> filter(Distance > 1930))
+```
+
+```{r}
+flights_subset_4 |> 
+  filter(Distance > 4700) |> 
+  head()
+```
+
+We generate a contingency table to ensure we have enough diverted samples for each year.
+```{r}
+table(flights_subset_4$Year, flights_subset_4$Diverted)
+```
+
+Checking the data type of each variables.
+```{r}
+str(flights_subset_4)
+```
+
+
+Converting categorical variables we will be using to fit our logistic regression to factors. Reference will be selected based on the group with highest frequency. For time interval, month and day of week, reference will be "12am - 4am", Jan and Monday respectively. This will enhance the interpretation of the model summary.
+```{r}
+# Convert Carrier variable to factor
+flights_subset_3$Carrier <- factor(flights_subset_3$Carrier)
+
+# Use relevel function on Carrier variable
+flights_subset_3$Carrier <- relevel(flights_subset_3$Carrier, ref = "Southwest Airlines Co.")
+```
+
+```{r}
+# Convert Carrier variable to factor
+flights_subset_4$Carrier <- factor(flights_subset_4$Carrier)
+
+# Use relevel function on Carrier variable
+flights_subset_4$Carrier <- relevel(flights_subset_4$Carrier, ref = "Southwest Airlines Co.")
+
+# Convert aircraft type variable to factor
+flights_subset_4$aircraft_type <- factor(flights_subset_4$aircraft_type)
+
+# Use relevel function on aircraft type variable
+flights_subset_4$aircraft_type <- relevel(flights_subset_4$aircraft_type, ref = "Fixed Wing Multi-Engine")
+
+# Convert engine type variable to factor
+flights_subset_4$engine_type <- factor(flights_subset_4$engine_type)
+
+# Use relevel function on engine type variable
+flights_subset_4$engine_type <- relevel(flights_subset_4$engine_type, ref = "Turbo-Fan")
+
+# Convert manufacturer variable to factor
+flights_subset_4$manufacturer <- factor(flights_subset_4$manufacturer)
+
+# Use relevel function on manufacturer variable
+flights_subset_4$manufacturer <- relevel(flights_subset_4$manufacturer, ref = "Boeing")
+str(flights_subset_4)
+```
+
+
+```{r}
+flights_subset_4 <- flights_subset_4 |> 
+  select("Distance",
+         "DepartureInterval",
+         "ArrivalInterval",
+         "Month",
+         "DayOfWeek",
+         "Carrier",
+         "lat_Origin",
+         "long_Origin",
+         "lat_Dest",
+         "long_Dest",
+         "Year",
+         "Diverted",
+         "engine_type",
+         "aircraft_type",
+         "manufacturer",
+         "PlaneAge")
+```
+
+Convert Carrier to names viable for r programming to read
+```{r}
+flights_subset_4$Carrier <- make.names(flights_subset_4$Carrier)
+```
+
+
+```{r}
+# Convert Carrier variable to factor
+flights_subset_4$Carrier <- factor(flights_subset_4$Carrier)
+
+# Use relevel function on Carrier variable
+flights_subset_4$Carrier <- relevel(flights_subset_4$Carrier, ref = "Southwest.Airlines.Co.")
+```
+
+# Features Selection
+
+Given the extensive size of our dataset, we opt to work with a smaller sample size for model training and testing purposes. Selecting just 5% of the total population not only ensures meaningful results but also significantly improves programming efficiency by reducing processing time.
+```{r}
+subsample_proportion <- 0.05
+
+num_subsample <- round(nrow(flights_subset_4) * subsample_proportion)
+
+# Perform random subsampling
+set.seed(2222)  
+subsample_indices <- sample(1:nrow(flights_subset_4), num_subsample)
+flights_subset_4_subsample <- flights_subset_4[subsample_indices, ]
+
+# Convert Diverted to factors
+flights_subset_4_subsample$Diverted <- factor(ifelse(flights_subset_4_subsample$Diverted == 0, "Not.Diverted", "Diverted"))
+
+```
+
+We further split the data into training and testing set, stratifying by diverted to ensure there are the same proportion of diverted observations for both training and testing set.
+```{r}
+# Split data into training and testing sets
+set.seed(4444) # for reproducibility
+split <- sample.split(flights_subset_4_subsample$Diverted, SplitRatio = 0.7)
+train_data <- flights_subset_4_subsample[split, ]
+test_data <- flights_subset_4_subsample[!split, ]
+```
+
+We perform a quick logistic model summary all the variables.
+```{r}
+logistic_model <- glm(Diverted ~ . , data = train_data, family = "binomial")
+summary(logistic_model)
+```
+
+## Feature Selection
+
+Upon assessing multicollinearity, it's evident that high VIF values are observed for the Departure Interval and Arrival Interval variables. Consequently, we will exclude the Arrival Interval variable from our model, given that diverted flights are primarily associated with departure-related factors.
+
+In addition, high VIF values are also observed for engine_type, manufacturer, aircraft_type, PlaneAge and Carrier. We will carry out Chi-Square Test, Cramera_V and Anova to determine if there's any association between the variables.
+```{r}
+vif(logistic_model)
+
+rm(logistic_model)
+rm(flights_subset_4)
+```
+
+```{r}
+chi_sq_test <- chisq.test(flights_subset_4_subsample$Carrier, flights_subset_4_subsample$aircraft_type)
+print(chi_sq_test)
+```
+
+```{r}
+cramers_v <- assocstats(table(flights_subset_4_subsample$Carrier, flights_subset_4_subsample$aircraft_type))
+print(cramers_v)
+```
+
+```{r}
+chi_sq_test <- chisq.test(flights_subset_4_subsample$engine_type, flights_subset_4_subsample$Carrier)
+print(chi_sq_test)
+```
+
+```{r}
+cramers_v <- assocstats(table(flights_subset_4_subsample$engine_type, flights_subset_4_subsample$Carrier))
+print(cramers_v)
+```
+
+```{r}
+chi_sq_test <- chisq.test(flights_subset_4_subsample$manufacturer, flights_subset_4_subsample$Carrier)
+print(chi_sq_test)
+```
+
+```{r}
+cramers_v <- assocstats(table(flights_subset_4_subsample$manufacturer, flights_subset_4_subsample$Carrier))
+print(cramers_v)
+```
+
+```{r}
+anova_result <- aov(PlaneAge ~ Carrier, data = flights_subset_4_subsample)
+summary(anova_result)
+```
+Since correlation is observed between Carrier and various variables associated with aircraft information, we will remove them and retain only Carrier Variable. 
+```{r}
+flights_subset_4_subsample <- flights_subset_4_subsample |> 
+  select(-manufacturer,
+         -engine_type,
+         -aircraft_type,
+         -Year,
+         -ArrivalInterval,
+         -PlaneAge)
+```
+
+
+During the merging process of the flights and aircraft dataframes, we encountered missing information in the aircraft data, resulting in the omission of several entries with NA values. To address this, we will revert to using the original dataframe before the merge operation.
+
+We remove all objects in the global environment to free up memory.
+```{r}
+objects_to_keep <- c("flights_subset_3")
+
+#Retrive the names of all objects in our global environment.
+all_objects <- ls()
+
+#Identify objects to remove (those not in the objects_to_keep list).
+objects_to_remove <- setdiff(all_objects, objects_to_keep)
+
+#Remove objects
+rm(list = objects_to_remove)
+```
+
+Selecting appropriate vairables for model training and testing.
+```{r}
+flights_subset_3 <- flights_subset_3 |> 
+  select("Distance",
+         "DepartureInterval",
+         "Month",
+         "DayOfWeek",
+         "Carrier",
+         "lat_Origin",
+         "long_Origin",
+         "lat_Dest",
+         "long_Dest",
+         "Diverted",
+         "Year")
+```
+
+
+Sample from the subset to enhance the processing speed.
+```{r}
+subsample_proportion <- 0.05
+
+num_subsample <- round(nrow(flights_subset_3) * subsample_proportion)
+
+# Perform random subsampling
+set.seed(5555)  
+subsample_indices <- sample(1:nrow(flights_subset_3), num_subsample)
+flights_subset_3_subsample <- flights_subset_3[subsample_indices, ]
+
+# Convert Year and Diverted to factors
+flights_subset_3_subsample$Diverted <- factor(ifelse(flights_subset_3_subsample$Diverted == 0, "Not.Diverted", "Diverted"))
+
+```
+
+
+```{r}
+#We store our predictors name in a list.
+predictors <- c("Distance","DepartureInterval", "Month", "DayOfWeek",  "Carrier", "lat_Origin", "long_Origin", "lat_Dest", "long_Dest")
+
+# Split data into training and testing sets
+set.seed(6666)
+split <- sample.split(flights_subset_3_subsample$Diverted, SplitRatio = 0.7)
+train_data <- flights_subset_3_subsample[split, ]
+test_data <- flights_subset_3_subsample[!split, ]
+```
+
+
+A function is defined to fit a logistic model for each feature and perform cross validation to calculate the AUC mean scores. The results will be stored in a list.
+```{r}
+fit_logistic_model_xval <- function(predictor, data, k = 4) {
+  auc_values <- numeric(k)
+  
+  # Create indices for k-fold cross-validation
+  folds <- cut(seq(1, nrow(data)), breaks = k, labels = FALSE)
+  
+  for (i in 1:k) {
+    # Define train and test indices for current fold
+    test_indices <- which(folds == i)
+    train_data <- data[-test_indices, ]
+    test_data <- data[test_indices, ]
+    
+    # Fitting the log reg model
+    formula <- as.formula(paste("Diverted", "~", predictor))
+    model <- glm(formula, data = train_data, family = "binomial")
+    
+    # Compute AUC scores
+    roc_obj <- roc(test_data$Diverted, predict(model, newdata = test_data, type = "response"))
+    auc_values[i] <- auc(roc_obj)
+  }
+  return(auc_values)
+}
+```
+
+
+```{r}
+k <- 4  
+auc_values_list <- lapply(predictors, fit_logistic_model_xval, data = train_data, k = k)
+
+# Create a dataframe to store AUC values
+auc_df <- data.frame(Predictor = rep(predictors, each = k),
+                     Fold = rep(1:k, times = length(predictors)),
+                     AUC = unlist(auc_values_list))
+
+# Print the dataframe
+print(auc_df)
+```
+Group and summarise the AUC results
+```{r}
+auc_summary <- auc_df |> 
+  group_by(Predictor) |> 
+  summarise(MeanAuc = mean(AUC)) |> 
+  arrange(desc(MeanAuc))
+
+print(auc_summary)
+```
+
+Heatmap is generated to visualise the results.
+```{r}
+heatmap <- ggplot(auc_df, aes(x = Predictor, y = Fold, fill = AUC)) +
+  geom_tile() +
+  geom_text(aes(label = round(AUC, 2)), color = "black", size = 3) +
+  scale_fill_gradient(low = "white", high = "darkgreen", na.value = "grey50") + # Adjust gradient colors as desired
+  labs(x = "Preductor",
+       y = "Fold",
+       fill = "AUC value",
+       title = "K-Fold Cross-Validation Results: AUC Scores for Models Tested on Single Predictor") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Print the heatmap
+print(heatmap)
+```
+
+Another function is defined that fit a log reg for feature sets containing all predictors except 1. Cross-validation is again performed to compute mean AUC scores, and stored in a list.
+```{r}
+fit_logistic_model_xval_all_except_one <- function(excluded_predictor, predictors, data, k = 4) {
+  auc_values <- list()
+  
+  # Create indices for k-fold cross-validation
+  folds <- cut(seq(1, nrow(data)), breaks = k, labels = FALSE)
+  
+  for (i in 1:k) {
+    # Define train and test indices for current fold
+    test_indices <- which(folds == i)
+    train_data <- data[-test_indices, ]
+    test_data <- data[test_indices, ]
+    
+    # Remove the excluded predictor from the list
+    predictors_to_use <- predictors[predictors != excluded_predictor]
+    
+    # Fit logistic regression model excluding the specified predictor
+    formula <- as.formula(paste("Diverted", "~", paste(predictors_to_use, collapse = "+")))
+    model <- glm(formula, data = train_data, family = "binomial")
+    
+    # Calculate AUC
+    roc_obj <- roc(test_data$Diverted, predict(model, newdata = test_data, type = "response"))
+    auc_values[[i]] <- auc(roc_obj)
+  }
+  return(auc_values)
+}
+```
+
+```{r}
+auc_values_list_excluded <- lapply(predictors, fit_logistic_model_xval_all_except_one, predictors = predictors, data = train_data, k = k)
+
+# Create a dataframe to store AUC values for each fold and model
+auc_df_excluded <- data.frame(Excluded_Predictor = rep(predictors, each = k),
+                              Fold = rep(1:k, times = length(predictors)),
+                              AUC = unlist(auc_values_list_excluded))
+
+# Print the dataframe
+print(auc_df_excluded)
+```
+
+```{r}
+auc_summary_excluded <- auc_df_excluded |> 
+  group_by(Excluded_Predictor) |> 
+  summarise(MeanAuc = mean(AUC)) |> 
+  arrange(MeanAuc)
+
+print(auc_summary_excluded)
+```
+
+Heatmap is generated to visualise the results
+```{r}
+heatmap <- ggplot(auc_df_excluded, aes(x = Excluded_Predictor, y = Fold, fill = AUC)) +
+  geom_tile() +
+  geom_text(aes(label = round(AUC, 2)), color = "black", size = 3) +
+  scale_fill_gradient(low = "white", high = "darkorange", na.value = "grey50") + # Adjust gradient colors as desired
+  labs(x = "Preductor",
+       y = "Fold",
+       fill = "AUC value",
+       title = "K-Fold Cross-Validation Results: AUC Scores for Full Models Excluding One Predictor at a Time") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Print the heatmap
+print(heatmap)
+```
+
+We fit a log reg model that includes all variables to determine the full_model AUC.
+```{r}
+
+# Initialize vector to store AUC values
+auc_values_full <- numeric(4)  # Assuming k = 4
+
+# Create indices for k-fold cross-validation
+folds <- cut(seq(1, nrow(train_data)), breaks = 4, labels = FALSE)
+
+# Perform cross-validation
+for (i in 1:4) {
+  # Define train and test indices for current fold
+  test_indices <- which(folds == i)
+  train_data_cv <- train_data[-test_indices, ]
+  test_data_cv <- train_data[test_indices, ]
+  
+  # Fitting log reg model on training data
+  full_model_cv <- glm(Diverted ~ ., data = train_data_cv, family = "binomial")
+  
+  # Predict probabilities on test data
+  predicted_probs_cv <- predict(full_model_cv, newdata = test_data_cv, type = "response")
+  
+  # Calculate AUC
+  roc_obj_full <- roc(test_data_cv$Diverted, predicted_probs_cv)
+  auc_values_full[i] <- auc(roc_obj_full)
+}
+
+# Compute mean AUC value
+mean_auc <- mean(auc_values_full)
+
+print(paste("Mean AUC for Full Model:", round(mean_auc, 3)))
+```
+Variables that do not have much explanatory power are removed. A log reg model will be fitted on the remaining variables to compute the AUC score.
+```{r}
+train_data_partial = train_data |> 
+  select(-lat_Dest,
+         -lat_Origin,
+         -DayOfWeek,
+         -DepartureInterval)
+
+# Initialize vector to store AUC values
+auc_values_partial <- numeric(4)  # Assuming k = 4
+
+# Create indices for k-fold cross-validation
+folds <- cut(seq(1, nrow(train_data_partial)), breaks = 4, labels = FALSE)
+
+# Perform cross-validation
+for (i in 1:4) {
+  # Define train and test indices for current fold
+  test_indices <- which(folds == i)
+  train_data_cv <- train_data_partial[-test_indices, ]
+  test_data_cv <- train_data_partial[test_indices, ]
+  
+  full_model_cv <- glm(Diverted ~ ., data = train_data_cv, family = "binomial")
+  
+  predicted_probs_cv <- predict(full_model_cv, newdata = test_data_cv, type = "response")
+  
+  roc_obj_partial <- roc(test_data_cv$Diverted, predicted_probs_cv)
+  auc_values_partial[i] <- auc(roc_obj_partial)
+}
+
+# Compute mean AUC value
+mean_auc_partial <- mean(auc_values_partial)
+
+print(paste("Mean AUC for Partial Model:", round(mean_auc_partial, 3)))
+```
+We remove lat_Dest, lat_Origin, DayOfWeek and Departure Interval from our model.
+```{r}
+flights_subset_3_subsample = flights_subset_3_subsample |> 
+  select(-lat_Dest,
+         -lat_Origin,
+         -DayOfWeek,
+         -DepartureInterval)
+```
+
+We define a new task for our machine learning pipeline. Subsequently, training and testing sets are created with the newly defined task.
+```{r}
+#Define Task
+task <- TaskClassif$new('flights', backend = flights_subset_3_subsample, target = 'Diverted')
+
+train_set = sample(task$nrow, 0.7 * task$nrow)
+test_set = setdiff(seq_len(task$nrow), train_set)
+
+task_train <- task$clone()$filter(train_set)
+task_test  <- task$clone()$filter(test_set)
+```
+
+```{r}
+# Define logistic regression model with probability predictions
+learner <- lrn("classif.glmnet", predict_type = "prob", alpha = 0) #glmnet will be used for penalised log reg models.
+
+# Define preprocessing pipeline
+gr_pipeline <- 
+  po("encode", method = "one-hot", affect_columns = selector_type("factor")) %>>%
+  po("scale", affect_columns = selector_type("integer")) %>>%
+  po(learner)
+
+param_grid <- ParamSet$new(params = list(
+  ParamDbl$new(id = "classif.glmnet.lambda.min.ratio", lower = 0, upper = 0.99) #tuning the lambda ratio
+))
+
+resampling <- rsmp("cv", folds = 4)
+
+tuner <- tnr('grid_search')
+
+measure <- msr("classif.auc")
+
+terminator <- trm("evals", n_evals = 10)
+# Create GraphLearner
+glrn_glmnet <- GraphLearner$new(gr_pipeline)
+
+logistic_learner <- AutoTuner$new(
+  learner = glrn_glmnet,
+  resampling = resampling,
+  measure = measure,
+  search_space = param_grid,
+  terminator = terminator,
+  tuner = tuner
+)
+```
+
+Training the model with the training set. Results show that AUC scores are the same for different value of lambda.
+```{r}
+logistic_learner$train(task_train)
+```
+
+```{r}
+pred <- logistic_learner$predict(task_test)
+```
+
+We create a new machine learning pipeline using the general logistic regression model.
+```{r}
+# Define logistic regression model with probability predictions
+learner <- lrn("classif.log_reg", predict_type = "prob")
+
+# Define preprocessing pipeline
+gr_pipeline <- 
+  po("encode", method = "one-hot", affect_columns = selector_type("factor")) %>>%
+  po("imputemedian", affect_columns = selector_type("integer")) %>>%
+  po("scale", affect_columns = selector_type("integer")) %>>%
+  po(learner)
+
+# Create GraphLearner
+glrn_logistic <- GraphLearner$new(gr_pipeline)
+```
+
+Training the log reg model by using the training set on the learner.
+```{r}
+logistic_model <- glrn_logistic$train(task_train)
+```
+
+Assessing the performance of the trained model using the test set.
+```{r}
+pred_logistic <- glrn_logistic$predict(task_test)
+```
+
+Compute the test AUC scores.
+```{r}
+# Extract prediction probabilities from pred_logistic test
+predicted_probabilities <- pred_logistic$prob
+# Extract predicted probabilities for the "Diverted" class
+predicted_probabilities_diverted <- predicted_probabilities[, "Diverted"]
+true_labels <- task_test$truth()
+# Convert true labels to binary format
+actual_binary <- ifelse(true_labels == "Diverted", 1, 0)
+
+# Compute ROC curve
+roc_curve <- roc(actual_binary, predicted_probabilities_diverted)
+
+# Compute AUC
+test_auc <- auc(roc_curve)
+
+print(test_auc)
+```
+
+Reviewing the coefficients for each variable.
+```{r}
+# Extract coefficients of the trained model
+coefficients <- coef(logistic_model$model$classif.log_reg$model)
+
+# Create a dataframe with coefficients and feature names
+coefficients_df <- data.frame(
+  Coefficient = coefficients
+)
+
+# Extract the index as values for the "Feature" column
+coefficients_df$Feature <- rownames(coefficients_df)
+
+# Reset row names
+rownames(coefficients_df) <- NULL
+
+# Print the dataframe
+print(coefficients_df)
+```
+We aim to visualise the coefficients of different variables across different years. To achieve this, we wil iterate through each yearly data subset, fitting a logistic regression model to extract the coefficients and storing it in a dataframe.
+```{r}
+# Define a function to train logistic regression model and extract coefficients
+train_and_get_coefficients <- function(task_train) {
+  # Train logistic regression model
+  logistic_model <- glrn_logistic$train(task_train)
+  # Extract coefficients
+  coefficients <- coef(logistic_model$model$classif.log_reg$model)
+  return(coefficients)
+}
+
+# Create an empty data table to store coefficients
+coefficients_df <- data.frame()
+
+# Iterate through each subset of flights dataset for each year
+for (year in unique(flights_subset_3_subsample$Year)) {
+  # Filter data for the current year
+  subset_data <- subset(flights_subset_3_subsample, Year == year)
+  
+  # Create a task for classification
+  task <- TaskClassif$new('flights', backend = subset_data, target = 'Diverted')
+  
+  # Split data into train and test sets
+  set.seed(12345)
+  train_set <- sample(task$nrow, 0.7 * task$nrow)
+  test_set <- setdiff(seq_len(task$nrow), train_set)
+  
+  task_train <- task$clone()$filter(train_set)
+  
+  # Train logistic regression model and extract coefficients
+  coefficients <- train_and_get_coefficients(task_train)
+  
+  # Create a data table with coefficients for the current year
+  coefficients_dt <- data.table(
+    Year = year,
+    Value = coefficients,
+    Coefficients = names(coefficients)  # Extract feature names directly from coefficients
+  )
+  
+  # Append coefficients for the current year to the main data table
+  coefficients_df <- rbind(coefficients_df, coefficients_dt)
+}
+
+# Print to review the coefficients
+print(coefficients_df)
+```
+
+# 4.3 Data Visualization
+
+We will create line charts and heatmaps to illustrate the relationship between the odds of flights diverting and each specific variable across different years. These charts will depict how the odds of flights being diverted change over time for each value of the variable under consideration.
+```{r}
+coefficients_month <- coefficients_df |> 
+  filter(str_starts(Coefficients, "Month"))
+
+month_names <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+coefficients_month$Coefficients <- gsub("Month.", "", coefficients_month$Coefficients)
+coefficients_month$Coefficients <- factor(coefficients_month$Coefficients, levels = month.abb, labels = month_names)
+
+print(coefficients_month)
+```
+
+```{r}
+coefficients_month <- coefficients_month %>%
+  arrange(Value) %>%
+  mutate(Coefficients = factor(Coefficients, levels = rev(unique(Coefficients))))
+
+custom_palette <- twilight_palette <- custom_palette <- c("#000000", "#4B0082", "#800080", "#FFA500", "#FFE4C4")
+```
+
+
+Creating Heatmap to visualise the coefficients for "Month" Variable across different year.
+```{r}
+ggplot(coefficients_month, aes(x = Year, y = Coefficients, fill = Value)) +
+  geom_tile() +
+  labs(title = "Heatmap of Month Coefficients Across Years (Reference = Dec)",
+       x = "Year",
+       y = "Coefficients",
+       fill = "Scaled Value") +
+  scale_fill_gradientn(colors = custom_palette, limits = c(min(coefficients_month$Value), max(coefficients_month$Value)), oob = scales::rescale_none) +  # Adjust color scale as needed
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = seq(1998, 2007)) +
+  guides(fill = guide_colorbar(reverse = TRUE))
+```
+
+Creating line charts to visualize the coefficients for different variables across different year.
+```{r}
+coefficients_distance <- coefficients_df |> 
+  filter(startsWith(Coefficients, "Distance"))
+```
+
+```{r}
+ggplot(coefficients_distance, aes(x = Year, y = Value)) +
+  geom_line() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Coefficients for distance across years",
+       x = "Year",
+       y = "Coefficient") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(1998, 2007, by = 2))
+```
+
+
+```{r}
+coefficients_long_origin <- coefficients_df |> 
+  filter(Coefficients %in% c("long_Origin"))
+```
+
+
+```{r}
+ggplot(coefficients_long_origin, aes(x = Year, y = Value)) +
+  geom_line() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Coefficients for Longitude Measurement (Origin Airport)",
+       x = "Year",
+       y = "Coefficient") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(1998, 2007, by = 2))
+```
+
+```{r}
+coefficients_long_dest <- coefficients_df |> 
+  filter(Coefficients %in% c("long_Dest"))
+```
+
+
+```{r}
+ggplot(coefficients_long_dest, aes(x = Year, y = Value)) +
+  geom_line() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  labs(title = "Coefficients for Longitude Measurement (Destination Airport)",
+       x = "Year",
+       y = "Coefficient") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(1998, 2007, by = 2))
+```
+
+Creating Heatmap to visualise the coefficients for "Carrier" Variable across different year.
+```{r}
+coefficients_Carrier <- coefficients_df |> 
+  filter(str_starts(Coefficients, "^Carrier"))
+
+
+coefficients_Carrier$Coefficients <- gsub("Carrier.", "", coefficients_Carrier$Coefficients)
+
+```
+
+```{r}
+coefficients_Carrier <- coefficients_Carrier %>%
+  arrange(Value) %>%
+  mutate(Coefficients = factor(Coefficients, levels = rev(unique(Coefficients))))
+
+custom_palette <- twilight_palette <- custom_palette <- c("#000000", "#4B0082", "#800080", "#FFA500", "#FFE4C4")
+```
+
+
+```{r}
+ggplot(coefficients_Carrier, aes(x = Year, y = Coefficients, fill = Value)) +
+  geom_tile() +
+  labs(title = "Heatmap of Carrier Coefficients Across Years (Reference = US Airways",
+       x = "Year",
+       y = "Coefficients",
+       fill = "Scaled Value") +
+  scale_fill_gradientn(colors = custom_palette, limits = c(min(coefficients_Carrier$Value), max(coefficients_Carrier$Value)), oob = scales::rescale_none) +  # Adjust color scale as needed
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = seq(1998, 2007)) +
+  guides(fill = guide_colorbar(reverse = TRUE))
+```
+
+Extracting the predicted probabilities and storing it as an object
+```{r}
+predicted_probabilities <- pred_logistic$prob
+```
+
+We conduct a sensitive analysis to visualize the trade-off between sensitivity and specificity.
+```{r}
+# Define threshold values to test
+threshold_values <- seq(0, 0.1, 0.001)
+
+# Initialize vectors to store evaluation metrics
+sensitivities <- numeric(length(threshold_values))
+specificities <- numeric(length(threshold_values))
+
+# Calculate sensitivity and specificity for each threshold value
+for (i in seq_along(threshold_values)) {
+    # Convert probabilities to binary predictions based on the threshold
+    y_pred_binary <- ifelse(predicted_probabilities[, "Diverted"] >= threshold_values[i], 1, 0)
+    
+    # Calculating true positives, true negatives, false positives, and false negatives
+    TP <- sum((task_test$truth() == "Diverted") & (y_pred_binary == 1))
+    TN <- sum((task_test$truth() == "Not.Diverted") & (y_pred_binary == 0))
+    FP <- sum((task_test$truth() == "Not.Diverted") & (y_pred_binary == 1))
+    FN <- sum((task_test$truth() == "Diverted") & (y_pred_binary == 0))
+    
+    sensitivity <- TP / (TP + FN) #Calculating the sensitivity %
+    specificity <- TN / (TN + FP) #Calculating the specificity %
+    
+    sensitivities[i] <- sensitivity #store resulting values in a vector
+    specificities[i] <- specificity
+}
+
+# Plot sensitivity and specificity vs. threshold
+plot(threshold_values, sensitivities, type = "l", col = "blue", xlab = "Threshold", ylab = "Sensitivity and Specificity", ylim = c(0, 1))
+lines(threshold_values, specificities, col = "orange")
+legend("topright", legend = c("Sensitivity (Recall)", "Specificity"), col = c("blue", "orange"), lty = 1)
+title(main = "Sensitivity and Specificity vs. Probability Threshold")
+grid(TRUE)
+```

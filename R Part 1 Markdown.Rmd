@@ -1,0 +1,155 @@
+---
+title: "Part 1 Markdown"
+author: "Felix,Zhikai"
+date: "2024-04-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Part 1
+## a) Apply the random walk Metropolis algorithm using N = 10000 and s = 1. Use the generated samples (x1, . . . xN ) to construct a histogram and a kernel density plot in the same figure. Note that these provide estimates of f (x).Overlay a graph of f (x) on this figure to visualise the quality of these estimates. Also, report the sample mean and standard deviation of the generated samples.
+
+```{r}
+library(tidyverse)
+```
+
+The probability density function is defined
+```{r}
+pdf_function <- function(x) {
+  return(0.5 * exp(-abs(x)))
+}
+```
+
+The function for Metropolis-Hastings algorithm is defined that return an array of samples generated from the PDF distribution using the algorithm when called.
+```{r}
+metropolis_hastings <- function(initial_value, N, s) {
+  samples <- numeric(N)
+  samples[1] <- initial_value
+  
+  for (i in 2:N) {
+    x_minus_1 <- samples[i - 1]
+    
+    x_random <- rnorm(1, mean = x_minus_1, sd = s) #a random number will be generated from a normal distribution centred around the previous number x_minus_1
+    
+    ratio <- pdf_function(x_random) / pdf_function(x_minus_1) #formula to compute the ratio
+    
+    u <- runif(1) #generate a random number from a uniform distribution ranging from 0 to 1
+    
+    if (u < ratio) {
+      samples[i] <- x_random
+    } else {
+      samples[i] <- x_minus_1 #if else statement that appends the chosen sample 
+    }
+  }
+  
+  return(samples) #return an array of samples after the iteration ends
+}
+```
+
+Defining the parameters and calling the function to generate an array of samples.
+```{r}
+N <- 100000 #set parameters
+s <- 1
+initial_value <- 0
+
+samples <- metropolis_hastings(initial_value, N, s)
+```
+
+Using the results a histogram and KDE plot is generated.
+```{r}
+samples_df <- data.frame(sample = samples)
+
+x_values <- seq(-10, 10, length.out = 10000)
+true_density <- pdf_function(x_values) #computing the true density values corresponding to each point of x_values.
+
+# Create histogram and density plot
+p1 <- ggplot(samples_df, aes(x = sample)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "skyblue", alpha = 0.5) +
+  geom_density(aes(color = "Sampled Distribution"), linewidth = 1) +
+  ggtitle("Monte Carlo Markov Chain - Metropolis-Hastings") +
+  xlab("x") +
+  ylab("Density") +
+  theme_minimal() +
+  geom_line(data = data.frame(x = x_values, y = true_density), 
+            aes(x, y, color = "True Distribution"), linetype = "dashed") +
+  scale_color_manual(values = c("blue", "red"), 
+                     labels = c("Sampled Distribution", "True Distribution")) +
+  annotate("text", x = -7, y = 0.4, label = paste("Sample Mean:", round(sample_mean, 3)), color = "blue") +
+  annotate("text", x = -7, y = 0.35, label = paste("Sample Std Dev:", round(sample_std, 3)), color = "blue")
+
+print(p1)
+```
+We extract and print the mean and standard deviation of the samples.
+```{r}
+# Calculate sample mean and sample standard deviation
+sample_mean <- mean(samples)
+sample_std <- sd(samples)
+
+cat("Sample Mean is ", sample_mean, "\n")
+cat("Sample Standard Deviation is ", sample_std, "\n")
+```
+
+The function to compute R hat value is defined.
+```{r}
+calculate_r <- function(B, W) {
+  return(sqrt((B + W) / W))
+}
+```
+
+We define the parameters to address part(b) and create an array to store the r-values
+```{r}
+N <- 2000 #set parameters
+J <- 4
+s_values <- seq(0.001, 1, length.out = 1000)
+R_Values <- numeric(length(s_values)) 
+```
+
+Random initial values are defined depending on the number of chain.
+```{r}
+initial_values <- sample(30, J, replace = FALSE)
+```
+
+Iterating over a sequence of s values and returning an array of r-values.
+```{r}
+for (i in seq_along(s_values)) {
+  s <- s_values[i]
+  
+  chains <- lapply(initial_values, function(initial_value) {
+    metropolis_hastings(initial_value, N, s) #for each iteration, the algorithm generate J chains for each s value using the algorithm,
+  })
+  
+  chain_sample_means <- sapply(chains, mean) # computing within-chain means and variances
+  chain_sample_variances <- sapply(chains, var)
+  
+  W <- mean(chain_sample_variances)  # computing W and M
+  M <- mean(chain_sample_means)
+  
+  # Compute B
+  B <- mean((chain_sample_means - M)^2) 
+  
+  # Calculate R
+  R <- calculate_r(B, W)
+  R_Values[i] <- R
+}
+```
+
+Dataframe is created using the resulting R-values. The data frame will then be used to plot the graph to visualize values of R over a grid of s values.
+```{r}
+data <- data.frame(s_values = s_values, R_Values = R_Values)
+
+# Plot the graph
+ggplot(data, aes(x = s_values, y = R_Values)) +
+  geom_line(color = "blue") +
+  labs(x = "s values", y = "R values", title = "R values over a grid of s values interval between 0.001 and 1.") +
+  theme_minimal()
+```
+The R-value when s = 0.001 is computed.
+```{r}
+# Filter the data for s = 0.001
+r_hat_s001 <- data$R_Values[data$s_values == 0.001]
+
+print(paste("R hat value for s = 0.001:", r_hat_s001))
+```
