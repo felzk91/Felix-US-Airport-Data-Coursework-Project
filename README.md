@@ -13,3 +13,9 @@ Utilising Packages from R and Python, the following questions were addressed:
 (b) Evaluate whether older planes suffer more delays on a year-to-year basis.
 
 (c) For each year, fit a logistic regression model for the probability of diverted US flights using as many features as possible from attributes of the departure date, the scheduled departure and arrival times, the coordinates and distance between departure and planned arrival airports, and the carrier. Visualize the coefficients across years.
+
+The repository comprises the following files:
+Coursework Report (PDF): Detailed report containing analysis, findings and conclusions.
+Jupyter Notebook Files (Python): Code scripts for Python analysis.
+R Markdown Files (R): Code scripts for R analysis.
+HTML Files: Output files displaying results for both Python and R.
