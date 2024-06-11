@@ -9,5 +9,7 @@ This dataset comprises flight details for all commercial flights on major carrie
 Utilising Packages from R and Python, the following questions were addressed:
 
 (a) What are the best times and days of the week to minimise delays each year?
+
 (b) Evaluate whether older planes suffer more delays on a year-to-year basis.
-(c) For each year, fit a logistic regression model for the probability of diverted US flights using as many features as possible from attributes of the departure date, the sched- uled departure and arrival times, the coordinates and distance between departure and planned arrival airports, and the carrier. Visualize the coefficients across years.
+
+(c) For each year, fit a logistic regression model for the probability of diverted US flights using as many features as possible from attributes of the departure date, the scheduled departure and arrival times, the coordinates and distance between departure and planned arrival airports, and the carrier. Visualize the coefficients across years.
