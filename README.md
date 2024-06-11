@@ -16,6 +16,10 @@ Utilising Packages from R and Python, the following questions were addressed:
 
 The repository comprises the following files:
 Coursework Report (PDF): Detailed report containing analysis, findings and conclusions.
+
 Jupyter Notebook Files (Python): Code scripts for Python analysis.
+
 R Markdown Files (R): Code scripts for R analysis.
+
 HTML Files: Output files displaying results for both Python and R.
+
